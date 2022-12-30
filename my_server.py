@@ -1,4 +1,4 @@
-import socket, time
+import socket, time, os
 from aioquic.buffer import Buffer
 from aioquic.quic import packet
 from aioquic.quic.configuration import QuicConfiguration
@@ -39,13 +39,27 @@ class MyServer:
         # analyze packet header, return PcketHeader object
         hdr = packet.pull_quic_header(Buffer(data=pkt), self.cfg.connection_id_length)
         self.print_packet_header(pkt, hdr, "->")
+
+        if hdr.version and hdr.version not in self.cfg.supported_versions:
+            self.negotiate_version(hdr, adr)
+            return
+
         # check MyConnection object
         mycon = self.con_map.get(hdr.destination_cid)
         # if no connection and packet is initial, make MyConnection object from QuicConnection object
         if mycon is None and hdr.packet_type == packet.PACKET_TYPE_INITIAL:
+
+            # if initial packets do not have a token, call retry
+            if not hdr.token:
+                self.retry(hdr, adr)
+                return
+            # retrieve a new connection id and old id(dcid)
+            retry_scid = hdr.token[0:8]
+            original_dcid = hdr.token[8:]
             con = QuicConnection(
                 configuration=self.cfg,
-                original_destination_connection_id=hdr.destination_cid,
+                retry_source_connection_id=retry_scid,
+                original_destination_connection_id=original_dcid,
             )
             mycon = MyConnection(con)
             self.con_map[con.host_cid] = mycon
@@ -85,3 +99,32 @@ class MyServer:
                 Buffer(data=pkt), self.cfg.connection_id_length
             )
             self.print_packet_header(pkt, hdr, "<-")
+
+    def negotiate_version(self, hdr: QuicHeader, adr: tuple):
+        # encode_quic_version_negotiation: generate QUIC packets for version negotiation
+        pkt = packet.encode_quic_version_negotiation(
+            source_cid=hdr.destination_cid,
+            destination_cid=hdr.source_cid,
+            supported_versions=self.cfg.supported_versions,
+        )
+        self.server_socket.sendto(pkt, adr)
+
+        hdr = packet.pull_quic_header(Buffer(data=pkt), self.cfg.connection_id_length)
+        self.print_packet_header(pkt, hdr, "<-")
+
+    def retry(self, hdr: QuicHeader, adr: tuple):
+        # generate a 8-byte random new id
+        new_cid = os.urandom(8)
+        token = new_cid + hdr.destination_cid
+
+        pkt = packet.encode_quic_retry(
+            version=hdr.version,
+            source_cid=new_cid,
+            destination_cid=hdr.source_cid,
+            original_destination_cid=hdr.destination_cid,
+            retry_token=token,
+        )
+        self.server_socket.sendto(pkt, adr)
+
+        hdr = packet.pull_quic_header(Buffer(data=pkt), self.cfg.connection_id_length)
+        self.print_packet_header(pkt, hdr, "<-")
